@@ -3,7 +3,7 @@ from ipycanvas import Canvas, hold_canvas
 
 
 class DrawCanvas:
-    def __init__(self, width=300, height=300):
+    def __init__(self, width=300, height=300, brush_size=2):
         self.canvas = Canvas(
             width=width,
             height=height,
@@ -19,7 +19,7 @@ class DrawCanvas:
         self.out = Output()
 
         # Create drawing tools
-        self.brush_size = IntSlider(value=2, min=1, max=20, description='Brush Size:')
+        self.brush_size = IntSlider(brush_size=2, min=1, max=20, description='Brush Size:')
         self.color_picker = ColorPicker(description='Color:', value='#ffffff')
         self.eraser_button = Button(description='Eraser', button_style='danger')
         self.clear_button = Button(description='Clear Canvas', button_style='warning')
