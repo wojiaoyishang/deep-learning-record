@@ -54,6 +54,11 @@ CNN 并没有重写，因为唐一旦老师对于 MLP 的学习为了更好理�
 
 [撑起计算机视觉半边天的ResNet【论文精读】](https://www.bilibili.com/video/BV1Fb4y1h73E)
 
+## 学习 RNN
+
+跟着唐一旦老师学习 RNN ，用 RNN 做文本生成，一开始使用 MLP 做文本生成，之后转向 RNN ，介绍了堆叠 RNN 和 LSTM，
+视频是 [徒手实现循环神经网络--自然语言处理的基本要素](https://www.bilibili.com/video/BV1cb421n78r) ，推荐观看。
+
 # 神经网络的概念建立
 
 下面的内容都是从学习过程中 COPY 出来的，方便定位和查漏补缺。
