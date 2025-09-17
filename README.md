@@ -61,6 +61,10 @@ CNN 并没有重写，因为唐一旦老师对于 MLP 的学习为了更好理�
 
 之后就是从零实现 GPT-2 的基本原理，推荐继续观看唐一旦老师的视频。
 
+## 读经典论文 Attention is All You Need
+
+完全理解 Self-Attention [Transformer论文逐段精读【论文精读】](https://www.bilibili.com/video/BV1pu411o7BE)
+
 # 神经网络的概念建立
 
 下面的内容都是从学习过程中 COPY 出来的，方便定位和查漏补缺。
