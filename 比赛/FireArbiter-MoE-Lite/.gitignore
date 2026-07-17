@@ -1,0 +1,6 @@
+models
+__pycache__
+.idea
+*.pth
+venv
+.venv
