@@ -11,12 +11,14 @@ import os
 import random
 import time
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,11 +44,11 @@ def build_train_config() -> Dict:
     expert_names = [
         "origin_competition",
         "open_fire_general",
-        "indoor_cctv_smoke",
-        "manual_local_crop",
-        "traffic_light_hard_negative",
-        "sunset_led_news_hard_negative",
-        "ultra_low_quality_blurry",
+        "indoor_kitchen_smoke",
+        "manual_crop_normal_things",
+        "traffic_vehicle_light",
+        "natural_sky_weather",
+        "artificial_light_product_media",
     ]
     return {
         "root": root,
@@ -67,13 +69,34 @@ def build_train_config() -> Dict:
             # 动态 LRU：每个 worker 各自拥有。
             "train_worker_cache_mb": 1024,
             "val_worker_cache_mb": 512,
+            # attention mask 的 worker 进程内 LRU。缓存的是 NPZ 解压后的
+            # positive/negative 二值 uint8 Tensor，避免每个 epoch 重复读盘和解压。
+            "train_worker_mask_cache_mb": 512,
+            "val_worker_mask_cache_mb": 256,
             # 可选只读预热缓存：DataLoader worker 启动前在父进程构建。
             # Linux 默认 fork 时，其 Tensor 存储页可在同一 rank 的 worker 间共享。
             # DDP 不同 rank 仍会各自持有一份，因此默认关闭，按机器内存手动调大。
-            "train_shared_preload_mb": 0,
+            "train_shared_preload_mb": 1024*4,
             "val_shared_preload_mb": 0,
-            "shared_preload_include_degraded": False,
-            "log_every_requests": 10000,
+            # attention mask 独立共享缓存上限。这里缓存 NPZ 解压后的二值 mask；
+            # 因此运行时不再重复读取/解压磁盘 NPZ。若希望尽量覆盖全部 mask，
+            # 可按启动日志中的“候选/已缓存”数量继续调大。
+            "train_shared_mask_preload_mb": 2048,
+            "val_shared_mask_preload_mb": 512,
+            # 首次建立共享缓存时的并行读取线程数。线程负责读盘、图片解码和缩放，
+            # 主线程统一把结果写入只读共享缓存，避免并发修改字典。
+            # Pillow 的主要解码/缩放工作在原生代码中执行，可与磁盘 I/O 并行。
+            "train_shared_preload_workers": 6,
+            "val_shared_preload_workers": 4,
+            # mask 可单独设置并行解压线程数；未设置时复用图片预加载线程数。
+            "train_shared_mask_preload_workers": 6,
+            "val_shared_mask_preload_workers": 4,
+            # 每个并行线程最多提前准备多少批任务；越大吞吐可能越高，
+            # 但会增加达到缓存上限时尚未写入缓存的临时图片内存。
+            "shared_preload_prefetch_factor": 2,
+            "shared_preload_include_degraded": True,
+            # 每个 worker 第 1 次取图立即打印，之后每 N 次打印一次真实命中率。
+            "log_every_requests": 1000,
         },
         "validation_attention_sample_index": 0,
         "expert_names": expert_names,
@@ -110,7 +133,7 @@ def build_train_config() -> Dict:
                 "weights": {"cls": 1.0, "branch": 0.30, "map": 0.25, "expert": 0.0, "calibration": 0.01},
             },
             "expert_specialization": {
-                "epochs": 3, "force_expert": True,
+                "epochs": 2, "force_expert": True,
                 "lr_head": 8.0e-5, "lr_backbone": 0.0, "lr_owl": 0.0,
                 "weights": {"cls": 0.40, "branch": 0.15, "map": 0.05, "expert": 0.80, "calibration": 0.0},
             },
@@ -120,7 +143,7 @@ def build_train_config() -> Dict:
                 "weights": {"cls": 1.0, "branch": 0.25, "map": 0.22, "expert": 0.25, "calibration": 0.01},
             },
             "owl_finetune": {
-                "epochs": 4, "force_expert": False,
+                "epochs": 5, "force_expert": False,
                 "lr_head": 1.8e-5, "lr_backbone": 2.5e-7, "lr_owl": 1.0e-7,
                 "weights": {"cls": 1.0, "branch": 0.22, "map": 0.25, "expert": 0.20, "calibration": 0.02},
             },
@@ -145,11 +168,13 @@ def build_train_config() -> Dict:
             "float32_matmul_precision": "high",
         },
         "run": {
-            "mode": "start",              # start / resume / finetune
+            "mode": "resume",  # start / resume / finetune
             "resume_path": "models_lite/latest.pth",
             "finetune_path": "models_lite/best.pth",
         },
     }
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -259,8 +284,8 @@ def uint8_tensor_to_normalized(image: torch.Tensor) -> torch.Tensor:
 
 
 def load_image_path_uint8_tensor(
-    image_path: Path,
-    image_target_height: Optional[int] = None,
+        image_path: Path,
+        image_target_height: Optional[int] = None,
 ) -> torch.Tensor:
     """打开图片、在训练端按配置缩放，然后返回 uint8 CHW。"""
     with Image.open(image_path) as source:
@@ -279,11 +304,11 @@ class WorkerImageLRUCache:
     """
 
     def __init__(
-        self,
-        enabled: bool,
-        max_mb: float,
-        name: str,
-        log_every_requests: int = 0,
+            self,
+            enabled: bool,
+            max_mb: float,
+            name: str,
+            log_every_requests: int = 0,
     ):
         self.enabled = bool(enabled) and float(max_mb) > 0.0
         self.max_bytes = max(0, int(float(max_mb) * 1024 * 1024))
@@ -398,7 +423,8 @@ class ImageDegradationAugmentor:
         self.enabled = bool(cfg.get("enabled", False))
         self.no_fire_prob = float(cfg.get("no_fire_prob", 0.50))
         self.fire_prob = float(cfg.get("fire_prob", 0.30))
-        self.no_fire_stage_weights = list(cfg.get("no_fire_stage_weights", [0.0, 0.0, 1.2, 1.4, 1.4, 1.2, 0.4, 0.4, 0.9, 0.8, 0.6, 0.2, 0.1]))
+        self.no_fire_stage_weights = list(
+            cfg.get("no_fire_stage_weights", [0.0, 0.0, 1.2, 1.4, 1.4, 1.2, 0.4, 0.4, 0.9, 0.8, 0.6, 0.2, 0.1]))
         self.fire_stage_weights = list(cfg.get("fire_stage_weights", [0.0, 0.8, 0.8, 0.6, 0.4, 0.2, 0.1]))
         self.max_stage = int(cfg.get("max_stage", 10))
 
@@ -437,15 +463,24 @@ class ImageDegradationAugmentor:
             1: {"jpeg_quality": 82},
             2: {"jpeg_quality": random.uniform(68, 78)},
             3: {"downscale": random.uniform(0.78, 0.90), "jpeg_quality": random.uniform(62, 74)},
-            4: {"downscale": random.uniform(0.66, 0.78), "blur": random.uniform(0.25, 0.55), "jpeg_quality": random.uniform(55, 68)},
-            5: {"downscale": random.uniform(0.54, 0.68), "blur": random.uniform(0.45, 0.85), "jpeg_quality": random.uniform(48, 60), "saturation": random.uniform(0.96, 1.08)},
-            6: {"downscale": random.uniform(0.46, 0.58), "blur": random.uniform(0.75, 1.15), "jpeg_quality": random.uniform(42, 54)},
-            7: {"downscale": random.uniform(0.40, 0.52), "blur": random.uniform(0.90, 1.35), "jpeg_quality": random.uniform(38, 50)},
-            8: {"downscale": random.uniform(0.34, 0.46), "blur": random.uniform(1.10, 1.65), "jpeg_quality": random.uniform(32, 44), "saturation": random.uniform(1.00, 1.12)},
-            9: {"downscale": random.uniform(0.28, 0.38), "blur": random.uniform(1.45, 2.10), "jpeg_quality": random.uniform(26, 36), "contrast": random.uniform(0.88, 0.98)},
-            10: {"downscale": random.uniform(0.22, 0.32), "blur": random.uniform(1.90, 2.70), "jpeg_quality": random.uniform(20, 30), "saturation": random.uniform(1.02, 1.16)},
-            11: {"downscale": random.uniform(0.18, 0.25), "blur": random.uniform(2.50, 3.40), "jpeg_quality": random.uniform(14, 22), "contrast": random.uniform(0.82, 0.92)},
-            12: {"downscale": random.uniform(0.14, 0.20), "blur": random.uniform(3.20, 4.20), "jpeg_quality": random.uniform(10, 16), "contrast": random.uniform(0.78, 0.88)},
+            4: {"downscale": random.uniform(0.66, 0.78), "blur": random.uniform(0.25, 0.55),
+                "jpeg_quality": random.uniform(55, 68)},
+            5: {"downscale": random.uniform(0.54, 0.68), "blur": random.uniform(0.45, 0.85),
+                "jpeg_quality": random.uniform(48, 60), "saturation": random.uniform(0.96, 1.08)},
+            6: {"downscale": random.uniform(0.46, 0.58), "blur": random.uniform(0.75, 1.15),
+                "jpeg_quality": random.uniform(42, 54)},
+            7: {"downscale": random.uniform(0.40, 0.52), "blur": random.uniform(0.90, 1.35),
+                "jpeg_quality": random.uniform(38, 50)},
+            8: {"downscale": random.uniform(0.34, 0.46), "blur": random.uniform(1.10, 1.65),
+                "jpeg_quality": random.uniform(32, 44), "saturation": random.uniform(1.00, 1.12)},
+            9: {"downscale": random.uniform(0.28, 0.38), "blur": random.uniform(1.45, 2.10),
+                "jpeg_quality": random.uniform(26, 36), "contrast": random.uniform(0.88, 0.98)},
+            10: {"downscale": random.uniform(0.22, 0.32), "blur": random.uniform(1.90, 2.70),
+                 "jpeg_quality": random.uniform(20, 30), "saturation": random.uniform(1.02, 1.16)},
+            11: {"downscale": random.uniform(0.18, 0.25), "blur": random.uniform(2.50, 3.40),
+                 "jpeg_quality": random.uniform(14, 22), "contrast": random.uniform(0.82, 0.92)},
+            12: {"downscale": random.uniform(0.14, 0.20), "blur": random.uniform(3.20, 4.20),
+                 "jpeg_quality": random.uniform(10, 16), "contrast": random.uniform(0.78, 0.88)},
         }
         params = dict(table.get(int(stage), table[0]))
         if int(label) == 1:
@@ -595,47 +630,82 @@ def resolve_mask_npz_path(row: pd.Series, root: Path) -> Optional[Path]:
     return path if path.exists() else None
 
 
-def resize_cached_mask(mask: np.ndarray, target_size) -> torch.Tensor:
+def _mask_array_to_uint8_tensor(mask: np.ndarray) -> torch.Tensor:
+    """把 NPZ 中的二维 mask 转为连续 CPU uint8 HW Tensor。"""
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        return torch.zeros((1, 1), dtype=torch.uint8)
+    binary = np.ascontiguousarray((array > 0).astype(np.uint8, copy=False))
+    return torch.from_numpy(binary)
+
+
+def load_attention_mask_uint8_pair(mask_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    一次打开 NPZ，同时读取 positive/negative mask，并转为 uint8 Tensor。
+
+    缓存的是“解压后的原始分辨率二值 mask”，这样无论训练图片最终宽高如何，
+    都可以在内存中做 nearest resize，而无需再次访问或解压磁盘文件。
+    """
+    with np.load(mask_path) as data:
+        pos_raw = data.get("positive_mask", None)
+        neg_raw = data.get("negative_mask", None)
+        pos_arr = np.asarray(pos_raw) if pos_raw is not None else None
+        neg_arr = np.asarray(neg_raw) if neg_raw is not None else None
+
+    valid_shape = None
+    if pos_arr is not None and pos_arr.ndim == 2:
+        valid_shape = tuple(int(v) for v in pos_arr.shape)
+    elif neg_arr is not None and neg_arr.ndim == 2:
+        valid_shape = tuple(int(v) for v in neg_arr.shape)
+    if valid_shape is None:
+        valid_shape = (1, 1)
+
+    if pos_arr is None or pos_arr.ndim != 2:
+        pos_arr = np.zeros(valid_shape, dtype=np.uint8)
+    if neg_arr is None or neg_arr.ndim != 2:
+        neg_arr = np.zeros(valid_shape, dtype=np.uint8)
+    return _mask_array_to_uint8_tensor(pos_arr), _mask_array_to_uint8_tensor(neg_arr)
+
+
+def resize_cached_mask(mask, target_size) -> torch.Tensor:
     if isinstance(target_size, tuple):
         target_h, target_w = int(target_size[0]), int(target_size[1])
     else:
         target_h = target_w = int(target_size)
-    if mask.ndim != 2:
-        mask = np.zeros((target_h, target_w), dtype=np.uint8)
-    tensor = torch.from_numpy((mask > 0).astype(np.float32)).view(1, 1, int(mask.shape[0]), int(mask.shape[1]))
+    if torch.is_tensor(mask):
+        tensor_hw = mask.detach().to(device="cpu")
+        if tensor_hw.ndim != 2:
+            tensor_hw = torch.zeros((target_h, target_w), dtype=torch.uint8)
+        tensor = tensor_hw.gt(0).to(dtype=torch.float32).view(
+            1, 1, int(tensor_hw.shape[0]), int(tensor_hw.shape[1])
+        )
+    else:
+        array = np.asarray(mask)
+        if array.ndim != 2:
+            array = np.zeros((target_h, target_w), dtype=np.uint8)
+        tensor = torch.from_numpy((array > 0).astype(np.float32)).view(
+            1, 1, int(array.shape[0]), int(array.shape[1])
+        )
     if tuple(tensor.shape[-2:]) != (target_h, target_w):
         tensor = F.interpolate(tensor, size=(target_h, target_w), mode="nearest")
     return tensor.view(1, target_h, target_w)
 
 
-def make_attention_target(row: pd.Series, root: Path, target_size) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    只读取划分/缓存阶段生成的 positive/negative mask。
-
-    图片级 label 始终负责分类监督；mask 只负责 attention 监督。
-    若 label=0 但缓存里存在 positive mask，训练端忽略 positive，只保留 negative。
-    """
+def make_attention_target_from_cached_pair(
+        pos_raw: torch.Tensor,
+        neg_raw: torch.Tensor,
+        label: int,
+        target_size,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """从内存中的原始 mask 构造训练 attention target。"""
     if isinstance(target_size, tuple):
         target_h, target_w = int(target_size[0]), int(target_size[1])
     else:
         target_h = target_w = int(target_size)
     zero = torch.zeros(1, target_h, target_w)
-    mask_path = resolve_mask_npz_path(row, root)
-    if mask_path is None:
-        return zero, zero, torch.tensor(False), torch.tensor(False)
-
-    try:
-        with np.load(mask_path) as data:
-            pos_arr = np.asarray(data.get("positive_mask", np.zeros((target_h, target_w), dtype=np.uint8)))
-            neg_arr = np.asarray(data.get("negative_mask", np.zeros((target_h, target_w), dtype=np.uint8)))
-    except Exception as exc:
-        print(f"[警告] mask npz 读取失败，跳过 attention 监督: {mask_path} ({exc})")
-        return zero, zero, torch.tensor(False), torch.tensor(False)
-
-    pos_mask = resize_cached_mask(pos_arr, target_size)
-    neg_mask = resize_cached_mask(neg_arr, target_size)
-    label = int(row.get("label", 0))
-    pos_valid = bool(label == 1 and pos_mask.sum().item() > 0)
+    pos_mask = resize_cached_mask(pos_raw, target_size)
+    neg_mask = resize_cached_mask(neg_raw, target_size)
+    pos_valid = bool(int(label) == 1 and pos_mask.sum().item() > 0)
     neg_valid = bool(neg_mask.sum().item() > 0)
     if pos_valid and neg_valid:
         neg_mask = (neg_mask * (1.0 - pos_mask)).clamp(0.0, 1.0)
@@ -647,17 +717,38 @@ def make_attention_target(row: pd.Series, root: Path, target_size) -> Tuple[torc
     return pos_mask, neg_mask, torch.tensor(pos_valid), torch.tensor(neg_valid)
 
 
+def make_attention_target(row: pd.Series, root: Path, target_size) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """兼容旧调用：直接从磁盘读取；FireDataset 训练路径使用内存缓存版本。"""
+    if isinstance(target_size, tuple):
+        target_h, target_w = int(target_size[0]), int(target_size[1])
+    else:
+        target_h = target_w = int(target_size)
+    zero = torch.zeros(1, target_h, target_w)
+    mask_path = resolve_mask_npz_path(row, root)
+    if mask_path is None:
+        return zero, zero, torch.tensor(False), torch.tensor(False)
+    try:
+        pos_raw, neg_raw = load_attention_mask_uint8_pair(mask_path)
+    except Exception as exc:
+        print(f"[警告] mask npz 读取失败，跳过 attention 监督: {mask_path} ({exc})")
+        return zero, zero, torch.tensor(False), torch.tensor(False)
+    return make_attention_target_from_cached_pair(
+        pos_raw, neg_raw, int(row.get("label", 0)), target_size
+    )
+
+
 class FireDataset(Dataset):
     def __init__(
-        self,
-        df: pd.DataFrame,
-        root: Path,
-        expert_to_index: Dict[str, int],
-        generic_expert_names: Sequence[str] = (),
-        image_target_height: Optional[int] = None,
-        degradation_config: Optional[Dict] = None,
-        image_cache_config: Optional[Dict] = None,
-        cache_name: str = "dataset",
+            self,
+            df: pd.DataFrame,
+            root: Path,
+            expert_to_index: Dict[str, int],
+            generic_expert_names: Sequence[str] = (),
+            image_target_height: Optional[int] = None,
+            degradation_config: Optional[Dict] = None,
+            image_cache_config: Optional[Dict] = None,
+            cache_name: str = "dataset",
     ):
         self.df = df.reset_index(drop=True)
         self.root = root
@@ -668,15 +759,59 @@ class FireDataset(Dataset):
         self.degradation_cache = OfflineDegradationCache(root, degradation_config)
         cache_cfg = dict(image_cache_config or {})
         self.cache_name = str(cache_name)
+        self.cache_log_every_requests = max(0, int(cache_cfg.get("log_every_requests", 0)))
+        cache_enabled = bool(cache_cfg.get("enabled", False))
         self.image_memory_cache = WorkerImageLRUCache(
-            enabled=bool(cache_cfg.get("enabled", False)),
+            enabled=cache_enabled,
             max_mb=float(cache_cfg.get("worker_cache_mb", 0.0)),
-            name=self.cache_name,
-            log_every_requests=int(cache_cfg.get("log_every_requests", 0)),
+            name=f"{self.cache_name}-image",
+            # 统一由 FireDataset 输出“共享缓存/LRU/磁盘”三级命中统计，
+            # 避免旧 LRU 日志把共享缓存请求排除后造成误判。
+            log_every_requests=0,
+        )
+        self.mask_memory_cache = WorkerImageLRUCache(
+            enabled=cache_enabled,
+            max_mb=float(cache_cfg.get("worker_mask_cache_mb", 0.0)),
+            name=f"{self.cache_name}-mask",
+            log_every_requests=0,
         )
         self.shared_image_cache: Dict[str, torch.Tensor] = {}
+        # 每个 mask 文件使用两个键分别保存 positive/negative uint8 HW Tensor。
+        # 两个条目只在完整读取成功后一起写入，训练阶段按 pair 命中。
+        self.shared_mask_cache: Dict[str, torch.Tensor] = {}
+        self._cache_stats_owner: Optional[Tuple[int, int]] = None
+        self._cache_requests = 0
+        self._shared_cache_hits = 0
+        self._worker_cache_hits = 0
+        self._disk_image_loads = 0
+        self._mask_requests = 0
+        self._shared_mask_hits = 0
+        self._worker_mask_hits = 0
+        self._disk_mask_loads = 0
+        self._missing_mask_samples = 0
         self.shared_preload_mb = float(cache_cfg.get("shared_preload_mb", 0.0))
+        self.shared_mask_preload_mb = float(cache_cfg.get("shared_mask_preload_mb", 0.0))
+        self.shared_preload_workers = max(1, int(cache_cfg.get("shared_preload_workers", 1)))
+        self.shared_mask_preload_workers = max(
+            1, int(cache_cfg.get("shared_mask_preload_workers", self.shared_preload_workers))
+        )
+        self.shared_preload_prefetch_factor = max(
+            1, int(cache_cfg.get("shared_preload_prefetch_factor", 2))
+        )
         self.shared_preload_include_degraded = bool(cache_cfg.get("shared_preload_include_degraded", False))
+
+        # 把路径解析和 exists() 检查前移到 Dataset 初始化，只执行一次。
+        # 训练 epoch 内不再对每个样本重复查询原图/mask 文件状态。
+        records = self.df.to_dict("records")
+        self._original_image_paths: List[Optional[Path]] = []
+        self._mask_paths: List[Optional[Path]] = []
+        for record in records:
+            try:
+                original_path = resolve_image_path(record, self.root)
+            except Exception:
+                original_path = None
+            self._original_image_paths.append(original_path)
+            self._mask_paths.append(resolve_mask_npz_path(record, self.root))
 
     def __len__(self) -> int:
         return len(self.df)
@@ -687,14 +822,17 @@ class FireDataset(Dataset):
         height_key = "none" if self.image_target_height is None else str(int(self.image_target_height))
         return f"{_normalize_path_key(str(image_path))}|height={height_key}"
 
+    @staticmethod
+    def _mask_cache_keys(mask_path: Path) -> Tuple[str, str]:
+        base = _normalize_path_key(str(mask_path))
+        return f"{base}|positive", f"{base}|negative"
+
     def _shared_preload_paths(self) -> List[Path]:
         """按 CSV 顺序返回唯一图片路径；可选追加离线降质图片。"""
         paths: List[Path] = []
         seen = set()
-        for record in self.df[[c for c in ("relative_path", "path") if c in self.df.columns]].to_dict("records"):
-            try:
-                path = resolve_image_path(record, self.root)
-            except Exception:
+        for path in self._original_image_paths:
+            if path is None:
                 continue
             key = _normalize_path_key(str(path))
             if key not in seen:
@@ -711,13 +849,146 @@ class FireDataset(Dataset):
                         paths.append(path)
         return paths
 
-    def build_shared_preload_cache(self) -> None:
-        """
-        在 DataLoader worker 启动前建立只读缓存。
+    def _shared_mask_preload_paths(self) -> List[Path]:
+        """按 CSV 顺序返回唯一且已存在的 attention mask NPZ 路径。"""
+        paths: List[Path] = []
+        seen = set()
+        for path in self._mask_paths:
+            if path is None:
+                continue
+            key = _normalize_path_key(str(path))
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+        return paths
 
-        Linux/fork 下缓存 Tensor 的底层内存页由同一 rank 的 worker 共享；
-        非 fork 启动方式尝试使用 torch shared memory。缓存只读，命中后
-        float()/归一化会创建新 Tensor，不会触发 copy-on-write。
+    def _iter_shared_preload_results(
+            self,
+            preload_paths: Sequence[Path],
+    ):
+        """
+        有界、按输入顺序返回共享缓存预加载结果。
+
+        workers=1 时保持原来的串行行为；workers>1 时，并行线程负责读盘、
+        PIL 解码和缩放。主线程仍是唯一的缓存写入者，因此 shared_image_cache
+        不需要锁，也不会因多个线程同时修改字典而损坏。
+
+        任务窗口受 workers * prefetch_factor 限制，避免一次提交全部图片后，
+        大量已解码 Tensor 在等待写入时额外占用内存。
+        """
+        workers = max(1, min(int(self.shared_preload_workers), len(preload_paths) or 1))
+        if workers <= 1:
+            for path in preload_paths:
+                try:
+                    image = load_image_path_uint8_tensor(path, self.image_target_height)
+                except Exception as exc:
+                    yield path, None, exc
+                else:
+                    yield path, image, None
+            return
+
+        max_in_flight = max(workers, workers * int(self.shared_preload_prefetch_factor))
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f"shared-preload-{self.cache_name}",
+        )
+        path_iter = iter(preload_paths)
+        pending: OrderedDict[Path, Future] = OrderedDict()
+
+        def submit_next() -> bool:
+            try:
+                path = next(path_iter)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                load_image_path_uint8_tensor,
+                path,
+                self.image_target_height,
+            )
+            pending[path] = future
+            return True
+
+        for _ in range(max_in_flight):
+            if not submit_next():
+                break
+
+        try:
+            while pending:
+                # 按 CSV/候选路径顺序写入缓存，使缓存内容与串行版本一致。
+                path, future = pending.popitem(last=False)
+                try:
+                    image = future.result()
+                except Exception as exc:
+                    yield path, None, exc
+                else:
+                    yield path, image, None
+                submit_next()
+        finally:
+            # 达到 MB 上限提前退出时，取消尚未开始的任务；已经运行的少量任务
+            # 等待正常结束，确保没有后台线程在 Dataset 构建结束后继续访问文件。
+            for future in pending.values():
+                future.cancel()
+            executor.shutdown(wait=True)
+
+    def _iter_shared_mask_preload_results(
+            self,
+            preload_paths: Sequence[Path],
+    ):
+        """有界并行读取并解压 mask NPZ；主线程按输入顺序写共享缓存。"""
+        workers = max(1, min(int(self.shared_mask_preload_workers), len(preload_paths) or 1))
+        if workers <= 1:
+            for path in preload_paths:
+                try:
+                    pos_raw, neg_raw = load_attention_mask_uint8_pair(path)
+                except Exception as exc:
+                    yield path, None, None, exc
+                else:
+                    yield path, pos_raw, neg_raw, None
+            return
+
+        max_in_flight = max(workers, workers * int(self.shared_preload_prefetch_factor))
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f"shared-mask-preload-{self.cache_name}",
+        )
+        path_iter = iter(preload_paths)
+        pending: OrderedDict[Path, Future] = OrderedDict()
+
+        def submit_next() -> bool:
+            try:
+                path = next(path_iter)
+            except StopIteration:
+                return False
+            pending[path] = executor.submit(load_attention_mask_uint8_pair, path)
+            return True
+
+        for _ in range(max_in_flight):
+            if not submit_next():
+                break
+
+        try:
+            while pending:
+                path, future = pending.popitem(last=False)
+                try:
+                    pos_raw, neg_raw = future.result()
+                except Exception as exc:
+                    yield path, None, None, exc
+                else:
+                    yield path, pos_raw, neg_raw, None
+                submit_next()
+        finally:
+            for future in pending.values():
+                future.cancel()
+            executor.shutdown(wait=True)
+
+    def _build_shared_image_preload_cache(self) -> None:
+        """
+        在 DataLoader worker 启动前建立只读图片缓存。
+
+        首次读盘、图片解码和缩放可由多个 CPU 线程并行完成；主线程按候选
+        路径顺序统一写入缓存。Linux/fork 下缓存 Tensor 的底层内存页由同一
+        rank 的 worker 共享；非 fork 启动方式尝试使用 torch shared memory。
+        缓存只读，命中后 float()/归一化会创建新 Tensor，不触发 copy-on-write。
         """
         max_bytes = max(0, int(self.shared_preload_mb * 1024 * 1024))
         if max_bytes <= 0 or self.shared_image_cache:
@@ -730,51 +1001,405 @@ class FireDataset(Dataset):
         used = 0
         loaded = 0
         failed = 0
+        stop_reason = "全部候选图片已处理"
+        preload_paths = self._shared_preload_paths()
+        preload_workers = max(1, min(self.shared_preload_workers, len(preload_paths) or 1))
+        show_progress = is_main_process()
+        max_mb = max_bytes / (1024 ** 2)
 
-        for path in self._shared_preload_paths():
-            key = self._image_cache_key(path)
-            if key in self.shared_image_cache:
-                continue
-            try:
-                image = load_image_path_uint8_tensor(path, self.image_target_height)
-            except Exception:
-                failed += 1
-                continue
-            item_bytes = int(image.numel() * image.element_size())
-            if item_bytes <= 0:
-                continue
-            if item_bytes > max_bytes or used + item_bytes > max_bytes:
-                break
-            if force_torch_shared:
+        # train_shared_preload_mb 与 val_shared_preload_mb 会分别调用本函数，
+        # 因而训练集、验证集各显示一条独立进度条。进度按候选图片数推进，
+        # postfix 同时展示缓存数量、内存占用和首次预加载并行线程数。
+        with tqdm(
+                total=len(preload_paths),
+                desc=f"共享缓存 {self.cache_name}",
+                unit="张",
+                dynamic_ncols=True,
+                leave=True,
+                disable=not show_progress,
+        ) as preload_progress:
+            for path, image, load_error in self._iter_shared_preload_results(preload_paths):
+                should_stop = False
                 try:
-                    image.share_memory_()
-                except Exception as exc:
-                    print(
-                        f"[图片共享预热] {self.cache_name} 无法分配 torch shared memory，"
-                        f"停止预热: {exc}"
+                    key = self._image_cache_key(path)
+                    if key not in self.shared_image_cache:
+                        if load_error is not None or image is None:
+                            failed += 1
+                        else:
+                            item_bytes = int(image.numel() * image.element_size())
+                            if item_bytes <= 0:
+                                failed += 1
+                            elif item_bytes > max_bytes:
+                                stop_reason = "单张图片大于缓存上限"
+                                should_stop = True
+                            elif used + item_bytes > max_bytes:
+                                stop_reason = "已达到缓存容量上限"
+                                should_stop = True
+                            else:
+                                if force_torch_shared:
+                                    try:
+                                        image.share_memory_()
+                                    except Exception as exc:
+                                        message = (
+                                            f"[图片共享预热] {self.cache_name} "
+                                            f"无法分配 torch shared memory，停止预热: {exc}"
+                                        )
+                                        if show_progress:
+                                            preload_progress.write(message)
+                                        else:
+                                            print(message)
+                                        stop_reason = "torch shared memory 分配失败"
+                                        should_stop = True
+                                if not should_stop:
+                                    self.shared_image_cache[key] = image
+                                    used += item_bytes
+                                    loaded += 1
+                finally:
+                    preload_progress.set_postfix(
+                        cached=loaded,
+                        failed=failed,
+                        workers=preload_workers,
+                        memory=f"{used / (1024 ** 2):.1f}/{max_mb:.1f} MB",
+                        refresh=False,
                     )
+                    preload_progress.update(1)
+                if should_stop:
                     break
-            self.shared_image_cache[key] = image
-            used += item_bytes
-            loaded += 1
+
+            preload_progress.set_postfix(
+                cached=loaded,
+                failed=failed,
+                workers=preload_workers,
+                memory=f"{used / (1024 ** 2):.1f}/{max_mb:.1f} MB",
+                status=stop_reason,
+                refresh=False,
+            )
 
         print(
             f"[图片共享预热] {self.cache_name} start={start_method} "
-            f"images={loaded} failed={failed} memory={used / (1024 ** 2):.1f}/"
-            f"{max_bytes / (1024 ** 2):.1f} MB"
+            f"preload_workers={preload_workers} images={loaded} failed={failed} "
+            f"memory={used / (1024 ** 2):.1f}/{max_mb:.1f} MB status={stop_reason}"
         )
 
+    def _build_shared_mask_preload_cache(self) -> None:
+        """在 DataLoader worker 启动前并行读取、解压并共享 attention mask。"""
+        max_bytes = max(0, int(self.shared_mask_preload_mb * 1024 * 1024))
+        if max_bytes <= 0 or self.shared_mask_cache:
+            return
+
+        start_method = mp.get_start_method(allow_none=True)
+        if start_method is None:
+            start_method = "fork" if os.name == "posix" else "spawn"
+        force_torch_shared = start_method != "fork"
+        used = 0
+        loaded = 0
+        failed = 0
+        stop_reason = "全部候选 mask 已处理"
+        preload_paths = self._shared_mask_preload_paths()
+        preload_workers = max(
+            1, min(self.shared_mask_preload_workers, len(preload_paths) or 1)
+        )
+        show_progress = is_main_process()
+        max_mb = max_bytes / (1024 ** 2)
+
+        with tqdm(
+                total=len(preload_paths),
+                desc=f"共享mask缓存 {self.cache_name}",
+                unit="个",
+                dynamic_ncols=True,
+                leave=True,
+                disable=not show_progress,
+        ) as preload_progress:
+            for path, pos_raw, neg_raw, load_error in self._iter_shared_mask_preload_results(preload_paths):
+                should_stop = False
+                try:
+                    pos_key, neg_key = self._mask_cache_keys(path)
+                    if pos_key in self.shared_mask_cache and neg_key in self.shared_mask_cache:
+                        continue
+                    if load_error is not None or pos_raw is None or neg_raw is None:
+                        failed += 1
+                    else:
+                        pos_raw = pos_raw.contiguous()
+                        neg_raw = neg_raw.contiguous()
+                        pair_bytes = int(
+                            pos_raw.numel() * pos_raw.element_size()
+                            + neg_raw.numel() * neg_raw.element_size()
+                        )
+                        if pair_bytes <= 0:
+                            failed += 1
+                        elif pair_bytes > max_bytes:
+                            stop_reason = "单个 mask 文件解压后大于缓存上限"
+                            should_stop = True
+                        elif used + pair_bytes > max_bytes:
+                            stop_reason = "已达到 mask 缓存容量上限"
+                            should_stop = True
+                        else:
+                            if force_torch_shared:
+                                try:
+                                    pos_raw.share_memory_()
+                                    neg_raw.share_memory_()
+                                except Exception as exc:
+                                    message = (
+                                        f"[mask共享预热] {self.cache_name} "
+                                        f"无法分配 torch shared memory，停止预热: {exc}"
+                                    )
+                                    if show_progress:
+                                        preload_progress.write(message)
+                                    else:
+                                        print(message)
+                                    stop_reason = "torch shared memory 分配失败"
+                                    should_stop = True
+                            if not should_stop:
+                                # pair 原子式写入：训练端不会看到只有 positive 或 negative 的半条记录。
+                                self.shared_mask_cache[pos_key] = pos_raw
+                                self.shared_mask_cache[neg_key] = neg_raw
+                                used += pair_bytes
+                                loaded += 1
+                finally:
+                    preload_progress.set_postfix(
+                        cached_files=loaded,
+                        failed=failed,
+                        workers=preload_workers,
+                        memory=f"{used / (1024 ** 2):.1f}/{max_mb:.1f} MB",
+                        refresh=False,
+                    )
+                    preload_progress.update(1)
+                if should_stop:
+                    break
+
+            preload_progress.set_postfix(
+                cached_files=loaded,
+                failed=failed,
+                workers=preload_workers,
+                memory=f"{used / (1024 ** 2):.1f}/{max_mb:.1f} MB",
+                status=stop_reason,
+                refresh=False,
+            )
+
+        print(
+            f"[mask共享预热] {self.cache_name} start={start_method} "
+            f"preload_workers={preload_workers} files={loaded}/{len(preload_paths)} "
+            f"failed={failed} tensors={len(self.shared_mask_cache)} "
+            f"memory={used / (1024 ** 2):.1f}/{max_mb:.1f} MB status={stop_reason}",
+            flush=True,
+        )
+
+    def build_shared_preload_cache(self) -> None:
+        """
+        构建训练时所有高频磁盘样本文件的共享缓存。
+
+        图片（原图/离线降质图）与 attention mask 使用独立内存上限；未被共享
+        预加载覆盖的文件，在 worker 第一次从磁盘读取后还会进入各 worker 的 LRU。
+        CSV、checkpoint、预训练权重只在启动/恢复时读取一次，不属于每样本重复 I/O。
+        """
+        self._build_shared_image_preload_cache()
+        self._build_shared_mask_preload_cache()
+        self._print_shared_cache_coverage_summary()
+
+    @staticmethod
+    def _current_cache_owner() -> Tuple[int, int]:
+        info = get_worker_info()
+        return os.getpid(), (-1 if info is None else int(info.id))
+
+    def _ensure_cache_stats_process_local(self) -> None:
+        owner = self._current_cache_owner()
+        if self._cache_stats_owner is None:
+            self._cache_stats_owner = owner
+        elif self._cache_stats_owner != owner:
+            # Dataset 经 fork/spawn 进入 DataLoader worker 后，统计必须从该
+            # worker 自己的第一个请求重新开始，不能继承父进程计数。
+            self._cache_stats_owner = owner
+            self._cache_requests = 0
+            self._shared_cache_hits = 0
+            self._worker_cache_hits = 0
+            self._disk_image_loads = 0
+            self._mask_requests = 0
+            self._shared_mask_hits = 0
+            self._worker_mask_hits = 0
+            self._disk_mask_loads = 0
+            self._missing_mask_samples = 0
+
+    def _maybe_log_cache_stats(self) -> None:
+        image_requests = int(self._cache_requests)
+        every = int(self.cache_log_every_requests)
+        if image_requests <= 0 or every <= 0:
+            return
+        # 在一个样本的 image 与 mask 都处理结束后输出，避免首条日志中 mask 仍为 0。
+        if image_requests != 1 and image_requests % every != 0:
+            return
+        image_shared_rate = self._shared_cache_hits / max(image_requests, 1)
+        image_total_hits = self._shared_cache_hits + self._worker_cache_hits
+        image_total_rate = image_total_hits / max(image_requests, 1)
+        mask_requests = int(self._mask_requests)
+        mask_shared_rate = self._shared_mask_hits / max(mask_requests, 1)
+        mask_total_hits = self._shared_mask_hits + self._worker_mask_hits
+        mask_total_rate = mask_total_hits / max(mask_requests, 1)
+        pid, worker_id = self._current_cache_owner()
+        print(
+            f"[缓存实测] {self.cache_name} pid={pid} worker={worker_id} "
+            f"image(req={image_requests}, shared={self._shared_cache_hits}, "
+            f"lru={self._worker_cache_hits}, disk={self._disk_image_loads}, "
+            f"shared_rate={image_shared_rate:.1%}, total_hit={image_total_rate:.1%}, "
+            f"shared_items={len(self.shared_image_cache)}) "
+            f"mask(req={mask_requests}, shared={self._shared_mask_hits}, "
+            f"lru={self._worker_mask_hits}, disk_npz={self._disk_mask_loads}, "
+            f"missing={self._missing_mask_samples}, shared_rate={mask_shared_rate:.1%}, "
+            f"total_hit={mask_total_rate:.1%}, shared_files={len(self.shared_mask_cache) // 2})",
+            flush=True,
+        )
+
+    def _print_shared_cache_coverage_summary(self) -> None:
+        """估算图片抽样命中率，并报告 attention mask 的实际共享覆盖率。"""
+        if self.shared_image_cache:
+            original_paths = set()
+            degraded_paths = set()
+            expected_hits = 0.0
+            valid_rows = 0
+
+            records = self.df.to_dict("records")
+            for idx, row in enumerate(records):
+                label = int(row.get("label", 0))
+                original_path = self._original_image_paths[idx]
+                if original_path is None:
+                    continue
+                original_paths.add(_normalize_path_key(str(original_path)))
+                original_hit = (
+                    1.0 if self._image_cache_key(original_path) in self.shared_image_cache else 0.0
+                )
+                row_expected = original_hit
+
+                if self.degradation_cache.enabled and self.degradation_cache.available:
+                    rel_key = _normalize_path_key(_clean_text(row.get("relative_path", "")))
+                    candidates = list(self.degradation_cache.by_key.get(rel_key, []))
+                    if self.degradation_cache.require_label_match:
+                        candidates = [
+                            item for item in candidates
+                            if int(item.get("label", -1)) == label
+                        ]
+                    if candidates:
+                        probability = (
+                            self.degradation_cache.fire_prob
+                            if label == 1 else self.degradation_cache.no_fire_prob
+                        )
+                        probability = max(0.0, min(1.0, float(probability)))
+                        degraded_hit_count = 0
+                        for item in candidates:
+                            degraded_path = Path(item["path"])
+                            degraded_paths.add(_normalize_path_key(str(degraded_path)))
+                            if self._image_cache_key(degraded_path) in self.shared_image_cache:
+                                degraded_hit_count += 1
+                        degraded_fraction = degraded_hit_count / max(len(candidates), 1)
+                        row_expected = (
+                            (1.0 - probability) * original_hit
+                            + probability * degraded_fraction
+                        )
+
+                expected_hits += row_expected
+                valid_rows += 1
+
+            cached_originals = sum(
+                self._image_cache_key(Path(path)) in self.shared_image_cache
+                for path in original_paths
+            )
+            cached_degraded = sum(
+                self._image_cache_key(Path(path)) in self.shared_image_cache
+                for path in degraded_paths
+            )
+            expected_rate = expected_hits / max(valid_rows, 1)
+            print(
+                f"[图片共享缓存覆盖率] {self.cache_name} "
+                f"original={cached_originals}/{len(original_paths)} "
+                f"({cached_originals / max(len(original_paths), 1):.1%}) "
+                f"degraded={cached_degraded}/{len(degraded_paths)} "
+                f"estimated_request_hit={expected_rate:.1%}。"
+                "该值按原图/离线降质图抽样概率估算；周期日志为最终实测。",
+                flush=True,
+            )
+
+        unique_masks = self._shared_mask_preload_paths()
+        if unique_masks:
+            cached_masks = 0
+            for path in unique_masks:
+                pos_key, neg_key = self._mask_cache_keys(path)
+                if pos_key in self.shared_mask_cache and neg_key in self.shared_mask_cache:
+                    cached_masks += 1
+            print(
+                f"[mask共享缓存覆盖率] {self.cache_name} "
+                f"files={cached_masks}/{len(unique_masks)} "
+                f"({cached_masks / max(len(unique_masks), 1):.1%}) "
+                f"samples_without_mask={sum(path is None for path in self._mask_paths)}/{len(self._mask_paths)}。"
+                "未进入共享缓存的 mask 会在各 DataLoader worker 首次读取后进入 LRU。",
+                flush=True,
+            )
+
     def _load_resized_uint8(self, image_path: Path) -> torch.Tensor:
+        self._ensure_cache_stats_process_local()
+        self._cache_requests += 1
         key = self._image_cache_key(image_path)
         shared = self.shared_image_cache.get(key)
         if shared is not None:
+            self._shared_cache_hits += 1
             return shared
         cached = self.image_memory_cache.get(key)
         if cached is not None:
+            self._worker_cache_hits += 1
             return cached
+        self._disk_image_loads += 1
         image = load_image_path_uint8_tensor(image_path, self.image_target_height)
         self.image_memory_cache.put(key, image)
         return image
+
+    def _load_attention_mask_uint8_pair(
+            self,
+            mask_path: Path,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """按共享缓存 -> worker LRU -> 磁盘 NPZ 的顺序取得原始二值 mask。"""
+        self._ensure_cache_stats_process_local()
+        self._mask_requests += 1
+        pos_key, neg_key = self._mask_cache_keys(mask_path)
+
+        pos_raw = self.shared_mask_cache.get(pos_key)
+        neg_raw = self.shared_mask_cache.get(neg_key)
+        if pos_raw is not None and neg_raw is not None:
+            self._shared_mask_hits += 1
+            return pos_raw, neg_raw
+
+        pos_raw = self.mask_memory_cache.get(pos_key)
+        neg_raw = self.mask_memory_cache.get(neg_key)
+        if pos_raw is not None and neg_raw is not None:
+            self._worker_mask_hits += 1
+            return pos_raw, neg_raw
+
+        self._disk_mask_loads += 1
+        pos_raw, neg_raw = load_attention_mask_uint8_pair(mask_path)
+        # 两个条目一起回填；即使共享预加载预算不足，同一 worker 后续也不再读盘。
+        self.mask_memory_cache.put(pos_key, pos_raw)
+        self.mask_memory_cache.put(neg_key, neg_raw)
+        return pos_raw, neg_raw
+
+    def _make_attention_target(
+            self,
+            idx: int,
+            label: int,
+            target_size,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(target_size, tuple):
+            target_h, target_w = int(target_size[0]), int(target_size[1])
+        else:
+            target_h = target_w = int(target_size)
+        zero = torch.zeros(1, target_h, target_w)
+        mask_path = self._mask_paths[int(idx)]
+        if mask_path is None:
+            self._missing_mask_samples += 1
+            return zero, zero, torch.tensor(False), torch.tensor(False)
+        try:
+            pos_raw, neg_raw = self._load_attention_mask_uint8_pair(mask_path)
+        except Exception as exc:
+            print(f"[警告] mask npz 读取失败，跳过 attention 监督: {mask_path} ({exc})")
+            return zero, zero, torch.tensor(False), torch.tensor(False)
+        return make_attention_target_from_cached_pair(
+            pos_raw, neg_raw, int(label), target_size
+        )
 
     def __getitem__(self, idx: int) -> Dict:
         row = self.df.iloc[idx]
@@ -782,6 +1407,10 @@ class FireDataset(Dataset):
         expert_name = str(expert_raw) if expert_raw is not None and not pd.isna(expert_raw) else ""
         expert_valid = expert_name in self.expert_to_index and expert_name not in self.generic_expert_names
         label_value = int(row.get("label", 0))
+        original_path = self._original_image_paths[int(idx)]
+        if original_path is None:
+            # 初始化时已经完成一次路径解析；这里仅在缺失时重新抛出完整错误信息。
+            original_path = resolve_image_path(row, self.root)
         cached_image_path, cached_stage = self.degradation_cache.sample_path(row, label_value)
 
         if cached_image_path is not None:
@@ -792,7 +1421,6 @@ class FireDataset(Dataset):
             except Exception:
                 # 缓存图缺失/损坏时回退原图；失败路径不会写入内存 LRU。
                 cached_image_path, cached_stage = None, None
-                original_path = resolve_image_path(row, self.root)
                 image_uint8 = self._load_resized_uint8(original_path)
                 if self.degrader.enabled:
                     image_pil = self.degrader(uint8_tensor_to_pil(image_uint8), label_value)
@@ -800,7 +1428,6 @@ class FireDataset(Dataset):
                 else:
                     image = uint8_tensor_to_normalized(image_uint8)
         else:
-            original_path = resolve_image_path(row, self.root)
             image_uint8 = self._load_resized_uint8(original_path)
             # 只缓存随机增强之前的确定性图像。这样每次命中仍会重新随机增强，
             # 不会因为 LRU 把在线 augmentation 固定成第一次的结果。
@@ -810,7 +1437,10 @@ class FireDataset(Dataset):
             else:
                 image = uint8_tensor_to_normalized(image_uint8)
         image_h, image_w = int(image.shape[1]), int(image.shape[2])
-        attn_pos_mask, attn_neg_mask, attn_pos_valid, attn_neg_valid = make_attention_target(row, self.root, (image_h, image_w))
+        attn_pos_mask, attn_neg_mask, attn_pos_valid, attn_neg_valid = self._make_attention_target(
+            int(idx), label_value, (image_h, image_w)
+        )
+        self._maybe_log_cache_stats()
         return {
             "image": image,
             "label": torch.tensor(float(label_value), dtype=torch.float32),
@@ -876,33 +1506,47 @@ def fire_collate_fn(batch: Sequence[Dict]) -> Dict:
 
 
 def make_loaders(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    root: Path,
-    expert_to_index: Dict[str, int],
-    generic_expert_names: Sequence[str],
-    image_target_height: Optional[int],
-    batch_size: int,
-    num_workers: int,
-    persistent_workers: bool,
-    train_degradation_config: Optional[Dict] = None,
-    image_cache_config: Optional[Dict] = None,
-    distributed: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        root: Path,
+        expert_to_index: Dict[str, int],
+        generic_expert_names: Sequence[str],
+        image_target_height: Optional[int],
+        batch_size: int,
+        num_workers: int,
+        persistent_workers: bool,
+        train_degradation_config: Optional[Dict] = None,
+        image_cache_config: Optional[Dict] = None,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
     cache_cfg = dict(image_cache_config or {})
     train_cache_cfg = {
         "enabled": bool(cache_cfg.get("enabled", False)),
         "worker_cache_mb": float(cache_cfg.get("train_worker_cache_mb", cache_cfg.get("worker_cache_mb", 0.0))),
+        "worker_mask_cache_mb": float(cache_cfg.get("train_worker_mask_cache_mb", 0.0)),
         "shared_preload_mb": float(cache_cfg.get("train_shared_preload_mb", 0.0)),
+        "shared_mask_preload_mb": float(cache_cfg.get("train_shared_mask_preload_mb", 0.0)),
+        "shared_preload_workers": int(cache_cfg.get("train_shared_preload_workers", 1)),
+        "shared_mask_preload_workers": int(cache_cfg.get(
+            "train_shared_mask_preload_workers", cache_cfg.get("train_shared_preload_workers", 1)
+        )),
+        "shared_preload_prefetch_factor": int(cache_cfg.get("shared_preload_prefetch_factor", 2)),
         "shared_preload_include_degraded": bool(cache_cfg.get("shared_preload_include_degraded", False)),
         "log_every_requests": int(cache_cfg.get("log_every_requests", 0)),
     }
     val_cache_cfg = {
         "enabled": bool(cache_cfg.get("enabled", False)),
         "worker_cache_mb": float(cache_cfg.get("val_worker_cache_mb", cache_cfg.get("worker_cache_mb", 0.0))),
+        "worker_mask_cache_mb": float(cache_cfg.get("val_worker_mask_cache_mb", 0.0)),
         "shared_preload_mb": float(cache_cfg.get("val_shared_preload_mb", 0.0)),
+        "shared_mask_preload_mb": float(cache_cfg.get("val_shared_mask_preload_mb", 0.0)),
+        "shared_preload_workers": int(cache_cfg.get("val_shared_preload_workers", 1)),
+        "shared_mask_preload_workers": int(cache_cfg.get(
+            "val_shared_mask_preload_workers", cache_cfg.get("val_shared_preload_workers", 1)
+        )),
+        "shared_preload_prefetch_factor": int(cache_cfg.get("shared_preload_prefetch_factor", 2)),
         "shared_preload_include_degraded": False,
         "log_every_requests": int(cache_cfg.get("log_every_requests", 0)),
     }
@@ -949,8 +1593,6 @@ def make_loaders(
     return train_loader, val_loader, train_sampler
 
 
-
-
 def init_distributed() -> Tuple[bool, int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
@@ -984,11 +1626,11 @@ def configure_torch_runtime(config: Dict, device: torch.device) -> None:
 
 
 def wrap_ddp_for_stage(
-    core: FireArbiterMoELite,
-    distributed: bool,
-    local_rank: int,
-    device: torch.device,
-    config: Dict,
+        core: FireArbiterMoELite,
+        distributed: bool,
+        local_rank: int,
+        device: torch.device,
+        config: Dict,
 ) -> nn.Module:
     """在阶段冻结完成后创建 DDP，使 reducer 只记录本阶段可训练参数。"""
     if not distributed:
@@ -1046,9 +1688,9 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def tolerant_map_loss(
-    attention: torch.Tensor,
-    batch: Dict,
-    negative_weight: float = 1.0,
+        attention: torch.Tensor,
+        batch: Dict,
+        negative_weight: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """静态图友好的 attention loss：每个 step 都执行同一组张量运算。"""
     pos = F.interpolate(batch["attention_pos_mask"].float(), size=attention.shape[-2:], mode="nearest")
@@ -1068,10 +1710,10 @@ def tolerant_map_loss(
     far = (attention * outside).sum((1, 2, 3)) / outside.sum((1, 2, 3)).clamp_min(1.0)
     energy = (attention * pos).sum((1, 2, 3)) / attention.sum((1, 2, 3)).clamp_min(1e-6)
     pos_per_sample = (
-        F.relu(0.40 - inside_mean).pow(2)
-        + 0.35 * F.relu(0.70 - inside_peak).pow(2)
-        + 0.40 * F.relu(0.20 - soft_coverage).pow(2)
-        + 0.25 * far
+            F.relu(0.40 - inside_mean).pow(2)
+            + 0.35 * F.relu(0.70 - inside_peak).pow(2)
+            + 0.40 * F.relu(0.20 - soft_coverage).pow(2)
+            + 0.25 * far
     )
     pos_loss = _masked_mean(pos_per_sample, pos_valid)
 
@@ -1090,9 +1732,9 @@ def compute_losses(output: Dict[str, torch.Tensor], batch: Dict, weights: Dict[s
     sample_weight = batch["sample_weight"].float()
     cls = weighted_bce(output["logit"], label, sample_weight)
     branch = (
-        0.35 * weighted_bce(output["global_logit"], label, sample_weight)
-        + 0.45 * weighted_bce(output["local_logit"], label, sample_weight)
-        + 0.20 * weighted_bce(output["semantic_logit"], label, sample_weight)
+            0.35 * weighted_bce(output["global_logit"], label, sample_weight)
+            + 0.45 * weighted_bce(output["local_logit"], label, sample_weight)
+            + 0.20 * weighted_bce(output["semantic_logit"], label, sample_weight)
     )
 
     # weights 在一个阶段内是 Python 常量，并且每个阶段都会重新创建 DDP。
@@ -1103,10 +1745,10 @@ def compute_losses(output: Dict[str, torch.Tensor], batch: Dict, weights: Dict[s
     if float(weights.get("map", 0.0)) > 0.0:
         map_terms = []
         for name, coefficient, neg_weight in (
-            ("global", 0.20, 1.00),
-            ("local", 0.65, 1.00),
-            ("semantic", 0.75, 0.45),
-            ("mix", 1.00, 1.00),
+                ("global", 0.20, 1.00),
+                ("local", 0.65, 1.00),
+                ("semantic", 0.75, 0.45),
+                ("mix", 1.00, 1.00),
         ):
             value, stats = tolerant_map_loss(output[f"attention_{name}"], batch, negative_weight=neg_weight)
             map_terms.append(coefficient * value)
@@ -1142,12 +1784,12 @@ def compute_losses(output: Dict[str, torch.Tensor], batch: Dict, weights: Dict[s
         uniform = torch.full_like(mean_weight, 1.0 / mean_weight.numel())
         balance = F.kl_div(mean_weight.log(), uniform, reduction="sum")
         expert = (
-            selected_loss
-            + 0.5 * routed_loss
-            + 0.5 * posterior_kl
-            + 0.25 * confidence_loss
-            + 0.15 * prior_guidance
-            + 0.02 * balance
+                selected_loss
+                + 0.5 * routed_loss
+                + 0.5 * posterior_kl
+                + 0.25 * confidence_loss
+                + 0.15 * prior_guidance
+                + 0.02 * balance
         )
     else:
         # calibration 阶段 expert=0：保留输出字段，但不构建无意义的专家 loss 图。
@@ -1158,11 +1800,11 @@ def compute_losses(output: Dict[str, torch.Tensor], batch: Dict, weights: Dict[s
 
     calibration = (torch.sigmoid(output["logit"].view(-1)) - label).pow(2).mean()
     total = (
-        float(weights["cls"]) * cls
-        + float(weights["branch"]) * branch
-        + float(weights["map"]) * map_loss
-        + float(weights["expert"]) * expert
-        + float(weights["calibration"]) * calibration
+            float(weights["cls"]) * cls
+            + float(weights["branch"]) * branch
+            + float(weights["map"]) * map_loss
+            + float(weights["expert"]) * expert
+            + float(weights["calibration"]) * calibration
     )
     return {
         "total": total,
@@ -1207,7 +1849,8 @@ def binary_auc(probs: np.ndarray, labels: np.ndarray) -> float:
     order = np.argsort(probs)
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, len(probs) + 1, dtype=np.float64)
-    return float((ranks[positive].sum() - positive.sum() * (positive.sum() + 1) / 2) / (positive.sum() * negative.sum()))
+    return float(
+        (ranks[positive].sum() - positive.sum() * (positive.sum() + 1) / 2) / (positive.sum() * negative.sum()))
 
 
 def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, bins: int = 10) -> float:
@@ -1309,7 +1952,8 @@ class EpochCollector:
 
 
 def move_batch(batch: Dict, device: torch.device) -> Dict:
-    return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
+    return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in
+            batch.items()}
 
 
 def make_optimizer(model: FireArbiterMoELite, stage: Dict, weight_decay: float):
@@ -1333,17 +1977,17 @@ def make_optimizer(model: FireArbiterMoELite, stage: Dict, weight_decay: float):
 
 
 def run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    weights: Dict[str, float],
-    optimizer: Optional[torch.optim.Optimizer],
-    scaler: torch.cuda.amp.GradScaler,
-    epoch: int,
-    stage: str,
-    stage_epoch: int,
-    stage_total_epochs: int,
-    force_expert: bool,
+        model: nn.Module,
+        loader: DataLoader,
+        device: torch.device,
+        weights: Dict[str, float],
+        optimizer: Optional[torch.optim.Optimizer],
+        scaler: torch.cuda.amp.GradScaler,
+        epoch: int,
+        stage: str,
+        stage_epoch: int,
+        stage_total_epochs: int,
+        force_expert: bool,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -1358,6 +2002,10 @@ def run_epoch(
         disable=not is_main_process(),
     )
     running_tp = running_fp = running_fn = running_correct = running_count = 0
+    epoch_wall_start = time.perf_counter()
+    previous_batch_end = epoch_wall_start
+    data_wait_total = 0.0
+    processed_batches = 0
     trainable_parameters = (
         [parameter for group in optimizer.param_groups for parameter in group["params"]]
         if training else []
@@ -1366,10 +2014,14 @@ def run_epoch(
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for batch in progress:
+            batch_arrival_time = time.perf_counter()
+            data_wait_total += max(0.0, batch_arrival_time - previous_batch_end)
+            processed_batches += 1
             batch = move_batch(batch, device)
             forced = None
             if force_expert:
-                forced = torch.where(batch["expert_valid"], batch["expert_index"], torch.full_like(batch["expert_index"], -1))
+                forced = torch.where(batch["expert_valid"], batch["expert_index"],
+                                     torch.full_like(batch["expert_index"], -1))
             if training:
                 optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
@@ -1393,17 +2045,34 @@ def run_epoch(
             precision = running_tp / max(running_tp + running_fp, 1)
             recall = running_tp / max(running_tp + running_fn, 1)
             running_f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+            average_data_wait_ms = 1000.0 * data_wait_total / max(processed_batches, 1)
             progress.set_postfix(
                 loss=f"{float(losses['total'].detach()):.4f}",
                 acc=f"{running_correct / max(running_count, 1):.4f}",
                 f1=f"{running_f1:.4f}",
+                data_wait=f"{average_data_wait_ms:.1f}ms",
             )
 
             # Collector只保留CPU标量/数组；及时解除完整输出图和batch的引用，
             # 避免上一批计算图存活到下一批前向期间而抬高峰值显存。
             del pred, truth, output, losses, batch, forced
+            previous_batch_end = time.perf_counter()
 
-    return collector.compute(core.get_threshold())
+    metrics = collector.compute(core.get_threshold())
+    epoch_wall_seconds = max(0.0, time.perf_counter() - epoch_wall_start)
+    metrics["epoch_wall_seconds"] = epoch_wall_seconds
+    metrics["data_wait_seconds"] = data_wait_total
+    metrics["data_wait_ms_per_batch"] = 1000.0 * data_wait_total / max(processed_batches, 1)
+    metrics["data_wait_fraction"] = data_wait_total / max(epoch_wall_seconds, 1e-12)
+    if is_main_process():
+        print(
+            f"[数据管线耗时] {'train' if training else 'val'} epoch={epoch} "
+            f"wall={epoch_wall_seconds:.2f}s data_wait={data_wait_total:.2f}s "
+            f"wait_per_batch={metrics['data_wait_ms_per_batch']:.2f}ms "
+            f"wait_fraction={metrics['data_wait_fraction']:.1%}",
+            flush=True,
+        )
+    return metrics
 
 
 def save_json(path: Path, data: Dict) -> None:
@@ -1423,19 +2092,19 @@ def inference_checkpoint_path(path: Path) -> Path:
 
 
 def save_checkpoint(
-    model: FireArbiterMoELite,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    scaler: torch.cuda.amp.GradScaler,
-    path: Path,
-    epoch: int,
-    stage: str,
-    stage_epoch: int,
-    stage_total_epochs: int,
-    history: List[Dict],
-    metadata: Dict,
-    best_score: float,
-    best_f1: float,
+        model: FireArbiterMoELite,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        scaler: torch.cuda.amp.GradScaler,
+        path: Path,
+        epoch: int,
+        stage: str,
+        stage_epoch: int,
+        stage_total_epochs: int,
+        history: List[Dict],
+        metadata: Dict,
+        best_score: float,
+        best_f1: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     expert_names = list(model.expert_names)
@@ -1493,12 +2162,12 @@ def denormalize_image(image: torch.Tensor, valid_mask: torch.Tensor) -> np.ndarr
 
 
 def save_expert_diagnostics_csv(
-    output_dir: Path,
-    epoch: int,
-    stage: str,
-    expert_names: Sequence[str],
-    train_metrics: Dict[str, float],
-    val_metrics: Dict[str, float],
+        output_dir: Path,
+        epoch: int,
+        stage: str,
+        expert_names: Sequence[str],
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
 ) -> None:
     rows = []
     for index, name in enumerate(expert_names):
@@ -1524,16 +2193,16 @@ def save_expert_diagnostics_csv(
 
 
 def save_attention_sample(
-    model: FireArbiterMoELite,
-    val_df: pd.DataFrame,
-    root: Path,
-    expert_to_index: Dict[str, int],
-    image_target_height: Optional[int],
-    device: torch.device,
-    output_dir: Path,
-    epoch: int,
-    stage: str,
-    sample_index: int,
+        model: FireArbiterMoELite,
+        val_df: pd.DataFrame,
+        root: Path,
+        expert_to_index: Dict[str, int],
+        image_target_height: Optional[int],
+        device: torch.device,
+        output_dir: Path,
+        epoch: int,
+        stage: str,
+        sample_index: int,
 ) -> None:
     if len(val_df) == 0:
         return
@@ -1556,7 +2225,8 @@ def save_attention_sample(
     axes[0].set_title("Input")
     axes[0].axis("off")
     for axis, (name, tensor) in zip(axes[1:], maps):
-        attention = F.interpolate(tensor[0:1], size=rgb.shape[:2], mode="bilinear", align_corners=False)[0, 0].cpu().numpy()
+        attention = F.interpolate(tensor[0:1], size=rgb.shape[:2], mode="bilinear", align_corners=False)[
+            0, 0].cpu().numpy()
         axis.imshow(rgb)
         axis.imshow(attention, alpha=0.48, cmap="jet", vmin=0.0, vmax=1.0)
         axis.set_title(name)
@@ -1595,11 +2265,11 @@ def selection_score(metrics: Dict[str, float]) -> float:
         return value if math.isfinite(value) else default
 
     return (
-        0.45 * finite("balanced_acc", 0.0)
-        + 0.30 * finite("f1", 0.0)
-        + 0.15 * finite("auc", 0.0)
-        - 0.05 * finite("ece", 1.0)
-        - 0.05 * finite("mix_far_leak", 1.0)
+            0.45 * finite("balanced_acc", 0.0)
+            + 0.30 * finite("f1", 0.0)
+            + 0.15 * finite("auc", 0.0)
+            - 0.05 * finite("ece", 1.0)
+            - 0.05 * finite("mix_far_leak", 1.0)
     )
 
 
@@ -1813,9 +2483,9 @@ def running_train(mode: str, checkpoint_path: Optional[str], config: Dict) -> No
                     "优化器状态恢复失败。请确认当前阶段的可训练参数分组与保存断点时一致。"
                 ) from exc
             extending_completed_stage = (
-                resume_stage_total > 0
-                and resume_stage_epoch >= resume_stage_total
-                and stage_total_epochs > resume_stage_epoch
+                    resume_stage_total > 0
+                    and resume_stage_epoch >= resume_stage_total
+                    and stage_total_epochs > resume_stage_epoch
             )
             if extending_completed_stage:
                 # 已完成阶段上追加轮次时，保留AdamW动量，但重新启用该阶段学习率，

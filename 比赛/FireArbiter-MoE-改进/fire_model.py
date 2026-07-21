@@ -783,13 +783,50 @@ class SemanticMapDecoder(nn.Module):
         return attention, feature
 
 
+class WholeImagePromptContext(nn.Module):
+    """使用 OWL 文本嵌入，将任意数量 Prompt 的整图响应压缩为固定维度。"""
+
+    def __init__(self, text_dim: int, output_dim: int = 256, topk_ratio: float = 0.08):
+        super().__init__()
+        self.topk_ratio = float(topk_ratio)
+        self.text_proj = nn.Linear(int(text_dim), int(output_dim), bias=False)
+        self.fusion = MLP(int(output_dim) * 6, max(256, int(output_dim) * 2), int(output_dim), dropout=0.05)
+
+    @staticmethod
+    def _weighted_pool(values: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(values, dim=1)
+        return (weights.unsqueeze(-1) * text_features).sum(dim=1)
+
+    def forward(
+            self,
+            logits: torch.Tensor,
+            text_embeds: torch.Tensor,
+            slices: Tuple[slice, slice, slice],
+    ) -> torch.Tensor:
+        patch_count = logits.shape[1]
+        k = max(1, int(round(patch_count * self.topk_ratio)))
+
+        strong_presence = logits.topk(k, dim=1).values.mean(dim=1)
+        broad_presence = logits.mean(dim=1)
+        text_features = F.normalize(self.text_proj(text_embeds), dim=-1)
+
+        contexts = []
+        for group_slice in slices:
+            group_text = text_features[:, group_slice]
+            contexts.append(self._weighted_pool(strong_presence[:, group_slice], group_text))
+            contexts.append(self._weighted_pool(broad_presence[:, group_slice], group_text))
+
+        return self.fusion(torch.cat(contexts, dim=1))
+
+
 class SemanticEvidenceHead(nn.Module):
-    def __init__(self, channels: int = 128):
+    def __init__(self, channels: int = 256, scene_context_dim: int = 256):
         super().__init__()
         self.pool = SoftRegionPool()
-        self.vector_head = MLP(channels + 6, 192, channels, dropout=0.05)
-        self.confidence_head = MLP(channels + 6, 96, 1, dropout=0.05)
-        self.logit_head = MLP(channels + 6, 128, 1, dropout=0.05)
+        descriptor_dim = channels + scene_context_dim + 6
+        self.vector_head = MLP(descriptor_dim, 256, channels, dropout=0.05)
+        self.confidence_head = MLP(descriptor_dim, 128, 1, dropout=0.05)
+        self.logit_head = MLP(descriptor_dim, 192, 1, dropout=0.05)
 
     @staticmethod
     def _statistics(attention: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
@@ -804,9 +841,14 @@ class SemanticEvidenceHead(nn.Module):
             feature: torch.Tensor,
             attention: torch.Tensor,
             scores: torch.Tensor,
+            scene_context: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pooled = self.pool(feature, attention)
-        descriptor = torch.cat([pooled, self._statistics(attention, scores)], dim=1)
+        descriptor = torch.cat([
+            pooled,
+            scene_context,
+            self._statistics(attention, scores),
+        ], dim=1)
         return (
             self.vector_head(descriptor),
             torch.sigmoid(self.confidence_head(descriptor)),
@@ -822,7 +864,8 @@ class OWLSemanticEncoder(nn.Module):
             model_name: Optional[str],
             prompt_bank: PromptBank,
             image_size: int = 384,
-            feature_dim: int = 128,
+            feature_dim: int = 256,
+            scene_context_dim: int = 256,
             vision_tail_layers: int = 2,
             text_tail_layers: int = 0,
             train_class_head: bool = True,
@@ -833,6 +876,7 @@ class OWLSemanticEncoder(nn.Module):
         self.prompt_bank = prompt_bank
         self.image_size = int(image_size)
         self.feature_dim = int(feature_dim)
+        self.scene_context_dim = int(scene_context_dim)
         self.vision_tail_layers = int(vision_tail_layers)
         self.text_tail_layers = int(text_tail_layers)
         self.train_class_head = bool(train_class_head)
@@ -847,6 +891,7 @@ class OWLSemanticEncoder(nn.Module):
         self.register_buffer("owl_std", torch.tensor(OWLVIT_IMAGE_STD).view(1, 3, 1, 1), persistent=False)
 
         owl_dim = 512
+        text_dim = 512
         self.supports_interpolate = False
         if model_name:
             from transformers import OwlViTForObjectDetection, OwlViTProcessor  # type: ignore
@@ -854,6 +899,7 @@ class OWLSemanticEncoder(nn.Module):
             self.model = OwlViTForObjectDetection.from_pretrained(model_name)
 
             owl_dim = int(self.model.config.vision_config.hidden_size)
+            text_dim = int(self.model.config.projection_dim)
 
             self.supports_interpolate = "interpolate_pos_encoding" in inspect.signature(self.model.forward).parameters
             self._configure_tuning()
@@ -863,7 +909,8 @@ class OWLSemanticEncoder(nn.Module):
         self.calibrator = GroupScoreCalibrator()
         self.box_field = SoftBoxField()
         self.map_decoder = SemanticMapDecoder(owl_dim, feature_dim)
-        self.evidence_head = SemanticEvidenceHead(feature_dim)
+        self.scene_context_encoder = WholeImagePromptContext(text_dim, self.scene_context_dim)
+        self.evidence_head = SemanticEvidenceHead(feature_dim, self.scene_context_dim)
         self.suspicious_scale = nn.Parameter(torch.tensor(-0.4))
         self.negative_scale = nn.Parameter(torch.tensor(0.0))
         self._cache_prompt_tokens()
@@ -1094,8 +1141,21 @@ class OWLSemanticEncoder(nn.Module):
         if valid_mask is not None:
             attention = attention * valid_mask
 
+        # 每条 Prompt 的响应与 OWL 文本嵌入共同形成整图语义；Prompt 数量可动态变化。
+        text_embeds = outputs.text_embeds.float().to(images.device)
+        scene_context = self.scene_context_encoder(
+            logits,
+            text_embeds,
+            self.group_slices,
+        )
+
         # LocalSemanticFusion会在真正需要时直接插值到局部特征尺寸，禁止先放大到原图再缩小。
-        vector, confidence, logit = self.evidence_head(semantic_grid, attention_grid, scores)
+        vector, confidence, logit = self.evidence_head(
+            semantic_grid,
+            attention_grid,
+            scores,
+            scene_context,
+        )
         return SemanticEvidence(group_maps, attention, semantic_grid, vector, scores, confidence, logit)
 
 
@@ -1532,7 +1592,7 @@ class LiteArbiter(nn.Module):
 
 
 class FireArbiterMoELite(nn.Module):
-    CHECKPOINT_FORMAT = "FireArbiter-MoE-Lite.v1"
+    CHECKPOINT_FORMAT = "FireArbiter-MoE-Lite.v2"
 
     def __init__(
             self,
@@ -1546,7 +1606,8 @@ class FireArbiterMoELite(nn.Module):
             pretrained_backbone: bool = True,
             convnext_trainable_layers: int = 1,
             owlvit_image_size: int = 384,
-            owlvit_feature_dim: int = 128,
+            owlvit_feature_dim: int = 256,
+            owlvit_scene_context_dim: int = 256,
             owlvit_trainable_vision_layers: int = 2,
             owlvit_trainable_text_layers: int = 0,
             owlvit_train_class_head: bool = True,
@@ -1568,6 +1629,7 @@ class FireArbiterMoELite(nn.Module):
         self.convnext_trainable_layers = int(convnext_trainable_layers)
         self.owlvit_image_size = int(owlvit_image_size)
         self.owlvit_feature_dim = int(owlvit_feature_dim)
+        self.owlvit_scene_context_dim = int(owlvit_scene_context_dim)
         self.owlvit_trainable_vision_layers = int(owlvit_trainable_vision_layers)
         self.owlvit_trainable_text_layers = int(owlvit_trainable_text_layers)
         self.owlvit_train_class_head = bool(owlvit_train_class_head)
@@ -1582,6 +1644,7 @@ class FireArbiterMoELite(nn.Module):
             PromptBank(self.positive_prompts, self.negative_prompts, self.suspicious_prompts),
             image_size=self.owlvit_image_size,
             feature_dim=self.owlvit_feature_dim,
+            scene_context_dim=self.owlvit_scene_context_dim,
             vision_tail_layers=self.owlvit_trainable_vision_layers,
             text_tail_layers=self.owlvit_trainable_text_layers,
             train_class_head=self.owlvit_train_class_head,
@@ -1716,6 +1779,7 @@ class FireArbiterMoELite(nn.Module):
             "convnext_trainable_layers": self.convnext_trainable_layers,
             "owlvit_image_size": self.owlvit_image_size,
             "owlvit_feature_dim": self.owlvit_feature_dim,
+            "owlvit_scene_context_dim": self.owlvit_scene_context_dim,
             "owlvit_trainable_vision_layers": self.owlvit_trainable_vision_layers,
             "owlvit_trainable_text_layers": self.owlvit_trainable_text_layers,
             "owlvit_train_class_head": self.owlvit_train_class_head,
@@ -1799,7 +1863,7 @@ if __name__ == "__main__":
         pretrained_backbone=True,
         convnext_trainable_layers=1,
         owlvit_image_size=768,
-        owlvit_feature_dim=128,
+        owlvit_feature_dim=256,
         owlvit_trainable_vision_layers=2,
         owlvit_trainable_text_layers=0,
         owlvit_train_class_head=True,
